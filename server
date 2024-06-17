@@ -1,0 +1,47 @@
+package main
+
+import (
+	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/middleware"
+	httpzaplog "github.com/illumitacit/httpzaplog"
+	"go.uber.org/zap"
+	"net/http"
+)
+
+func main() {
+	logger, _ := zap.NewProduction()
+	defer logger.Sync()
+	r := chi.NewRouter()
+
+	opts := &httpzaplog.Options{
+		Logger:  zap.Must(zap.NewProduction()),
+		Concise: true,
+	}
+	r.Use(httpzaplog.RequestLogger(opts))
+	r.Use(middleware.Heartbeat("/ping"))
+	// Определение маршрутов
+
+	r.Get("/1", handleRoute1)
+	r.Post("/2", handleRoute2)
+	r.Put("/3", handleRoute3)
+
+	http.ListenAndServe(":8080", r)
+}
+
+// HomeHandler обрабатывает запросы к главной странице
+func handleRoute1(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("Route 1"))
+}
+
+func handleRoute2(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("Route 2"))
+}
+
+func handleRoute3(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("Route 3"))
+}
+
+func LoggerMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	})
+}
