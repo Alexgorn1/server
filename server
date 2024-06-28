@@ -1,47 +1,197 @@
 package main
 
 import (
-	"github.com/go-chi/chi"
-	"github.com/go-chi/chi/middleware"
-	httpzaplog "github.com/illumitacit/httpzaplog"
-	"go.uber.org/zap"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
+
+	"github.com/ekomobile/dadata/v2"
+	"github.com/ekomobile/dadata/v2/api/suggest"
+	"github.com/ekomobile/dadata/v2/client"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/jwtauth/v5"
+	"golang.org/x/crypto/bcrypt"
 )
 
+//go:generate swagger generate spec -o ./swagger.json --scan-models
+
+var tokenAuth *jwtauth.JWTAuth
+var users map[string]string
+
+func init() {
+	tokenAuth = jwtauth.New("HS256", []byte("secret"), nil)
+}
+
+type User struct {
+	Name    string `json:"name"`
+	Pasword string `json:"pasword"`
+}
+
+// swagger:parameters searchAddress
+type SearchRequest struct {
+	// in:body
+	Query string `json:"query"`
+}
+
+// swagger:model
+type Address struct {
+	// in:body
+	City string `json:"city"`
+}
+
+// swagger:response searchAddressResponse
+type SearchResponse struct {
+	// in:body
+	Addresses []*Address `json:"addresses"`
+}
+
+// swagger:parameters geocodeAddress
+type GeocodeRequest struct {
+	// in:body
+	Lat string `json:"lat"`
+	Lon string `json:"lon"`
+}
+
+// swagger:response geocodeAddressResponse
+type GeocodeResponse struct {
+	// in:body
+	Addresses []*Address `json:"addresses"`
+}
+
 func main() {
-	logger, _ := zap.NewProduction()
-	defer logger.Sync()
+
+	http.ListenAndServe(":8080", router())
+
+}
+
+func router() http.Handler {
 	r := chi.NewRouter()
+	users = make(map[string]string)
 
-	opts := &httpzaplog.Options{
-		Logger:  zap.Must(zap.NewProduction()),
-		Concise: true,
-	}
-	r.Use(httpzaplog.RequestLogger(opts))
-	r.Use(middleware.Heartbeat("/ping"))
-	// Определение маршрутов
+	r.Group(func(r chi.Router) {
 
-	r.Get("/1", handleRoute1)
-	r.Post("/2", handleRoute2)
-	r.Put("/3", handleRoute3)
+		r.Use(jwtauth.Verifier(tokenAuth))
+		r.Use(jwtauth.Authenticator(tokenAuth))
+		r.Use(middleware.Logger)
 
-	http.ListenAndServe(":8080", r)
-}
+		creds := client.Credentials{
+			ApiKeyValue:    "45da51d74379e42196f26bd5e23076f5b3ad7916",
+			SecretKeyValue: "3890ad9d233ea66963994bb613ac02c264efbb0b",
+		}
 
-// HomeHandler обрабатывает запросы к главной странице
-func handleRoute1(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("Route 1"))
-}
+		api := dadata.NewSuggestApi(client.WithCredentialProvider(&creds))
 
-func handleRoute2(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("Route 2"))
-}
+		r.Post("/api/address/search", func(w http.ResponseWriter, r *http.Request) {
+			var searchRequest SearchRequest
+			if err := json.NewDecoder(r.Body).Decode(&searchRequest); err != nil {
+				http.Error(w, http.StatusText(400), 400)
+				return
+			}
 
-func handleRoute3(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("Route 3"))
-}
+			log.Println("Query: ", searchRequest.Query)
 
-func LoggerMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			addresses, err := api.GeoIP(context.Background(), searchRequest.Query)
+			if err != nil {
+				http.Error(w, http.StatusText(500), 500)
+				return
+			}
+
+			log.Println("Address: ", addresses.Location.Value)
+
+			var searchResponse SearchResponse
+			searchResponse.Addresses = []*Address{{City: addresses.Location.Value}}
+
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Accept", "application/json")
+			if err := json.NewEncoder(w).Encode(searchResponse); err != nil {
+				http.Error(w, http.StatusText(500), 500)
+			}
+		})
+
+		r.Post("/api/address/geocode", func(w http.ResponseWriter, r *http.Request) {
+			var req GeocodeRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, http.StatusText(400), 400)
+				return
+			}
+
+			geolocateParams := &suggest.GeolocateParams{
+				Lat:          req.Lat,
+				Lon:          req.Lon,
+				Count:        1,
+				RadiusMeters: 50,
+				Language:     "ru",
+			}
+
+			log.Println("geolocateParams: ", geolocateParams)
+
+			geocodeData, err := api.GeoLocate(context.Background(), geolocateParams)
+			if err != nil {
+				http.Error(w, http.StatusText(500), 500)
+				return
+			}
+
+			var addresses []*Address
+			for _, data := range geocodeData {
+				addresses = append(addresses, &Address{City: data.Data.City})
+			}
+
+			log.Println("addresses: ", *addresses[0])
+
+			resp := GeocodeResponse{Addresses: addresses}
+
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Accept", "application/json")
+			if err := json.NewEncoder(w).Encode(resp); err != nil {
+				http.Error(w, http.StatusText(500), 500)
+			}
+		})
 	})
+
+	r.Post("/api/register", func(w http.ResponseWriter, r *http.Request) {
+		var newUser User
+
+		if err := json.NewDecoder(r.Body).Decode(&newUser); err != nil {
+			http.Error(w, "Ошибка при хешировании пароля", 500)
+			return
+		}
+
+		if _, ok := users[newUser.Name]; ok == true {
+			http.Error(w, "Пользователь существует", 403)
+		}
+
+		passwordHash, err := bcrypt.GenerateFromPassword([]byte(newUser.Pasword), bcrypt.DefaultCost)
+		if err != nil {
+			http.Error(w, "Ошибка при хешировании пароля", 500)
+			return
+		}
+		users[newUser.Name] = string(passwordHash)
+		_, tokenString, _ := tokenAuth.Encode(map[string]interface{}{newUser.Name: newUser.Pasword})
+		w.Write([]byte(fmt.Sprintf("%v", tokenString)))
+	})
+
+	r.Post("/api/login", func(w http.ResponseWriter, r *http.Request) {
+		var user User
+
+		if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+			http.Error(w, "Ошибка при хешировании пароля", 500)
+			return
+		}
+
+		if _, ok := users[user.Name]; ok != true {
+			http.Error(w, "Пользователь не существует", 200)
+		}
+
+		if bcrypt.CompareHashAndPassword([]byte(users[user.Name]), []byte(user.Pasword)) != nil {
+			http.Error(w, "Неверный парорль", 200)
+		}
+
+		_, tokenString, _ := tokenAuth.Encode(map[string]interface{}{user.Name: user.Pasword})
+		w.Write([]byte(fmt.Sprintf("%v", tokenString)))
+	})
+
+	return r
 }
