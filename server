@@ -7,12 +7,12 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/ekomobile/dadata/v2"
+	dadata "github.com/ekomobile/dadata/v2"
 	"github.com/ekomobile/dadata/v2/api/suggest"
 	"github.com/ekomobile/dadata/v2/client"
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/jwtauth/v5"
+	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/middleware"
+	"github.com/go-chi/jwtauth"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -70,13 +70,13 @@ func main() {
 
 	r.Use(middleware.Logger)
 
-	r.Post("/api/register", Register)
+	r.Post("/api/register", registerHandler)
 
-	r.Post("/api/login", Login)
+	r.Post("/api/login", loginHandler)
 
 	r.Group(func(r chi.Router) {
 		r.Use(jwtauth.Verifier(tokenAuth))
-		r.Use(jwtauth.Authenticator(tokenAuth))
+		r.Use(jwtauth.Authenticator)
 
 		r.Post("/api/address/search", Search)
 
@@ -86,56 +86,64 @@ func main() {
 	http.ListenAndServe(":8080", r)
 }
 
-func Register(w http.ResponseWriter, r *http.Request) {
+func loginHandler(w http.ResponseWriter, r *http.Request) {
 	var req User
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Ошибка при хешировании пароля", 500)
+		log.Println("Error decoding request:", err)
+		http.Error(w, "Invalid request format", http.StatusBadRequest)
 		return
 	}
 
-	if _, ok := userStore.users[req.Name]; ok == true {
-		http.Error(w, "Пользователь существует", 403)
-	}
+	userStore.RLock()
+	hashedPassword, ok := userStore.users[req.Name]
+	userStore.RUnlock()
 
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-	if err != nil {
-		http.Error(w, "Ошибка при хешировании пароля", http.StatusInternalServerError)
+	if !ok {
+		log.Println("Invalid username or password")
+		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
 		return
 	}
-	userStore.Lock()
-	userStore.users[req.Name] = string(passwordHash)
-	userStore.Unlock()
-	_, tokenString, _ := tokenAuth.Encode(map[string]interface{}{req.Name: req.Password})
 
+	// Приведение hashedPassword к типу string
+	hashedPasswordStr, ok := hashedPassword.(string)
+	if !ok {
+		log.Println("Error converting hashed password to string")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Сравнение пароля
+	if bcrypt.CompareHashAndPassword([]byte(hashedPasswordStr), []byte(req.Password)) != nil {
+		log.Println("Invalid username or password")
+		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
+		return
+	}
+
+	_, tokenString, _ := tokenAuth.Encode(map[string]interface{}{"username": req.Name})
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]string{"token": tokenString}); err != nil {
 		log.Println("Error encoding response:", err)
 	}
 }
 
-func Login(w http.ResponseWriter, r *http.Request) {
+func registerHandler(w http.ResponseWriter, r *http.Request) {
 	var req User
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Ошибка при хешировании пароля", http.StatusInternalServerError)
+		http.Error(w, "Invalid request format", http.StatusBadRequest)
 		return
 	}
 
-	if _, ok := userStore.users[req.Name]; ok != true {
-		http.Error(w, "Пользователь не существует", 200)
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "Failed to hash password", http.StatusInternalServerError)
+		return
 	}
 
-	hashedPasswordStr := userStore.users[req.Name].(string)
+	userStore.Lock()
+	userStore.users[req.Name] = string(hashedPassword)
+	userStore.Unlock()
 
-	if bcrypt.CompareHashAndPassword([]byte(hashedPasswordStr), []byte(req.Password)) != nil {
-		http.Error(w, "Неверный парорль", 200)
-	}
-	_, tokenString, _ := tokenAuth.Encode(map[string]interface{}{req.Name: req.Password})
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]string{"token": tokenString}); err != nil {
-		log.Println("Error encoding response:", err)
-	}
+	w.WriteHeader(http.StatusCreated)
 }
 
 func Geocode(w http.ResponseWriter, r *http.Request) {
